@@ -1,0 +1,341 @@
+#!/usr/bin/perl -w
+
+ 
+# CHANGE LOG
+# ----------
+#  2026/10/23	njeffrey	Script created
+
+
+# NOTES
+# -----
+#  This script checks uptime for UNIX-like operating systems
+#
+#  Tested on AIX 6.1 and 7.1, IBM VIOS
+#  Tested on CentOS 7, Ubuntu 16.04 / 17.10 / 18.04, Raspian
+#  Tested on FreeBSD 11
+#  Tested on MacOS 10.12
+#  Not yet tested on OpenBSD, NetBSD, MacOS, SunOS, HP-UX (but is expected to work)
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking time synchronization
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             uptime
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_uptime"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking time synchronization
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             time sync
+#           check_command                   check_nrpe!check_unix_uptime
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[check_unix_uptime]=/usr/local/nagios/libexec/check_unix_uptime
+#
+
+
+
+
+# ASSUMPTIONS
+# -----------
+#  It is assumed that perl is installed on the machine running this script.
+#     For RHEL / CentOS     yum install perl
+#     For Debian / Ubuntu   apt install perl
+#     For FreeBSD           pkg install perl5
+#
+#  It is assumed that this script is being run as a low-privileged user (typically nagios), and that 
+#  typical user permissions are sufficient to run the "uptime" commands in this script.
+#
+#
+
+
+
+
+# TROUBLESHOOTING
+# ---------------
+#   The first line of this script is #!/usr/bin/perl, which is fine for most UNIX-like operating systems.
+#   However, FreeBSD puts the perl binary at /usr/local/bin/perl, so please create a symlink on FreeBSD:
+#      ln -s /usr/local/bin/perl /usr/bin/perl
+#
+#
+
+
+use strict;						#enforce good coding practices
+use Getopt::Long;                       		#allow --long-switches to be used as parameters
+
+#declare variables
+my ($verbose,$os,$cmd,$key);
+my ($uname,$uptime);
+my ($common_output_data,$perf_data);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+my ($opt_h,$opt_v,$opt_w,$opt_c);
+my ($warn_threshold,$critical_threshold);
+my ($default_warn_threshold,$default_critical_threshold);
+my ($uptime_minutes,$uptime_hours,$uptime_days);
+$verbose                    = "no";			#yes/no flag to increase verbosity during debugging
+$common_output_data         = "";                       #nagios output
+$perf_data                  = "";                       #nagios performance data included in output
+$CHECK_NAME                 = "uptime";
+$default_warn_threshold     = 30;			#default minutes to warn
+$default_critical_threshold = 5;			#default minutes to critical
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "Running get_options subroutine \n" if ($verbose eq "yes");
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"       => \$opt_h,
+      "v"   => \$opt_v, "verbose"    => \$opt_v,
+      "w=s" => \$opt_w, "warning=s"  => \$opt_w, "warn=s" => \$opt_w,
+      "c=s" => \$opt_c, "critical=s" => \$opt_c, "crit=s" => \$opt_c,
+   );
+   #
+   # If the user supplied the -h or --help switch, give them some help.
+   #
+   if( defined( $opt_h ) ) {
+      print "Use this syntax \n";
+      print "   $0 \n";
+      print "   $0 --verbose                  (increase output for debugging) \n";
+      print "   $0 --warn 30 --critical 5     (optional thresholds in minutes) \n";
+      exit $CRITICAL;				#exit script
+   }
+   #
+   # If the user supplied the --verbose switch, increase output verbosity
+   #
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } else {
+      $verbose = "no";
+   }
+   #
+   # If the user did not supply a --warn= threshold, use the default.
+   #
+   if( defined( $opt_w ) ) {
+      $warn_threshold = $opt_w;
+   } else {
+      $warn_threshold = $default_warn_threshold;
+   }
+   #
+   # If the user did not supply a --critical= threshold, use the default.
+   #
+   if( defined( $opt_c ) ) {
+      $critical_threshold = $opt_c;
+   } else {
+      $critical_threshold = $default_critical_threshold;
+   }
+
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "Running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm uname binary exists and is executable
+   # figure out where the uname command is on this system (varies across UNIX flavors)
+   $uname = "/bin/uname"      if ( -e "/bin/uname");	
+   $uname = "/sbin/uname"     if ( -e "/sbin/uname");	
+   $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname");	
+   $uname = "/usr/sbin/uname" if ( -e "/usr/sbin/uname");	
+   if ( ! -e $uname ) {
+      print "ERROR: Cannot find $uname binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $uname ) {
+      print "ERROR: $uname is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found uname binary at $uname \n" if ($verbose eq "yes");
+   #
+   # confirm uptime binary exists and is executable
+   # figure out where the uptime command is on this system (varies across UNIX flavors)
+   $uptime = "/bin/uptime"      if ( -e "/bin/uptime");	
+   $uptime = "/sbin/uptime"     if ( -e "/sbin/uptime");	
+   $uptime = "/usr/bin/uptime"  if ( -e "/usr/bin/uptime");	
+   $uptime = "/usr/sbin/uptime" if ( -e "/usr/sbin/uptime");	
+   if ( ! -e $uptime ) {
+      print "ERROR: Cannot find $uptime binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $uptime ) {
+      print "ERROR: $uptime is not executuable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found uptime binary at $uptime \n" if ($verbose eq "yes");
+}						#end of subroutine
+
+
+
+
+sub determine_os {
+   #
+   print "Running determine_os subroutine \n" if ($verbose eq "yes");
+   #
+   $cmd = "$uname";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #open filehandle using command output
+   while (<IN>) {                                                       #read a line from the command output
+      if (/AIX/) {
+         $os          = "AIX";		#figure out OS-specific parameters for ps command
+      } elsif (/HP-UX/) {
+         $os          = "HP-UX";
+      } elsif (/Linux/) {
+         $os          = "Linux";
+      } elsif (/SunOS/) {
+         $os          = "SunOS";
+      } elsif (/FreeBSD/) {
+         $os          = "FreeBSD";
+      } elsif (/NetBSD/) {
+         $os          = "NetBSD";
+      } elsif (/OpenBSD/) {
+         $os          = "OpenBSD";
+      } elsif (/Darwin/) {
+         $os          = "Darwin";
+      } else {
+         print "ERROR: Cannot determine operating system \n";
+         exit $CRITICAL;
+      } 								#end of if/elsif/else block
+   } 									#end of while loop
+   close IN;								#close filehandle
+   print "   operating system is $os \n" if ($verbose eq "yes");
+}						#end of subroutine
+
+
+
+
+
+
+
+
+
+sub check_uptime {
+   #
+   print "Running check_uptime subroutine \n" if ($verbose eq "yes");
+   #
+   # only check NTP synchronization if the machine has been up for at least one hour, just to give the clock time to settle.
+   # We figure this out by looking at the 4th field.  So long as it is not "min" or "mins," we should be ok.
+   # /usr/bin/uptime
+   #  04:32PM up 32  mins,  1 user,  load average: 1.21, 1.03, 0.74         <----- some Linux flavours report "mins"
+   #  17:11:49 up 48 min,  2 users,  load average: 0.00, 0.02, 0.05         <----- but other  flavours report "min"
+   #  17:23:19 up  1:00,  4 users,  load average: 0.19, 0.08, 0.06          <----- uptime one hour and 00 minutes
+   #  17:25:19 up  1:02,  4 users,  load average: 0.19, 0.08, 0.06          <----- uptime one hour and 02 minutes
+   #  04:37PM up 1 day, 6:07, 2 users, load average: 0.57, 0.93, 1.02	    <----- note singular "day"
+   #  04:37PM up 273 days, 6:07, 2 users, load average: 0.57, 0.93, 1.02    <----- note plural   "days"
+   #  05:41PM up   1:37,  2 users,  load average: 0.95, 1.52, 1.26
+   #
+   $cmd = "$uptime";
+   $uptime_minutes = 0; 						#initialize variable
+   $uptime_hours   = 0;							#initialize variable
+   $uptime_days    = 0;							#initialize variable
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                  	#open filehandle from command output
+   while (<IN>) {                                                      	#read a line from the command output
+      if ( /[a-zA-Z0-9:]+ +up +([0-9]+) +min,/ ) {  			#capture 32 min, 
+         $uptime_minutes = $1; 
+         print "   uptime_minutes:$uptime_minutes \n" if ($verbose eq "yes");
+      }
+      if ( /[a-zA-Z0-9:]+ +up +([0-9]+) +min,/ ) {  			#capture 32 mins, 
+         $uptime_minutes = $1; 
+         print "   uptime_minutes:$uptime_minutes \n" if ($verbose eq "yes");
+      }
+      if ( /[a-zA-Z0-9:]+ +up +([0-9]+):([0-9][0-9]),/) { 		#capture 1:02 hours
+         $uptime_hours   = $1; 
+         $uptime_minutes = $2; 
+         $uptime_minutes = ($uptime_hours * 60) + $uptime_minutes;     	#do some math to get total number of minutes uptime
+         print "   uptime_hours:$uptime_hours \n" if ($verbose eq "yes");
+      }
+      if ( /[a-zA-Z0-9:]+ +up +([0-9]+) +day,/ ) { 			#capture 1 day, 
+         $uptime_days    = $1; 
+         $uptime_hours   = ($uptime_days * 24);     			#do some math to get total number of hours   uptime
+         $uptime_minutes = ($uptime_hours * 60) + $uptime_minutes ;     #do some math to get total number of minutes uptime
+         print "   uptime_days:$uptime_days \n" if ($verbose eq "yes");
+      }
+      if ( /[a-zA-Z0-9:]+ +up +([0-9]+) +days,/ ) { 			#capture 273 days,
+         $uptime_days    = $1; 
+         $uptime_hours   = ($uptime_days * 24);     			#do some math to get total number of hours   uptime
+         $uptime_minutes = ($uptime_hours * 60) + $uptime_minutes ;     #do some math to get total number of minutes uptime
+         print "   uptime_days:$uptime_days \n" if ($verbose eq "yes");
+      }
+   } 						#end of while loop
+   close IN;					#close filehandle
+   #
+   # figure out if we want to report the uptime in minuts or hours or days
+   #
+   $common_output_data = "uptime is $uptime_minutes minutes" if ( $uptime_minutes > 0 );
+   $common_output_data = "uptime is $uptime_hours hours"     if ( $uptime_hours   > 0 );
+   $common_output_data = "uptime is $uptime_days days"       if ( $uptime_days    > 0 );
+}						#end of subroutine
+
+
+
+
+
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space.
+   # If you are pnp4nagios for graphing, each space-separated section will create a separate graph.
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes GB=gigabytes %=percent c=counter
+   $perf_data = "uptime_days=$uptime_days;;;;";
+   #
+   #
+   if ( $uptime_minutes > $warn_threshold ) {
+      print "$CHECK_NAME OK - $common_output_data | $perf_data \n";
+      exit $OK;
+   }
+   if ( $uptime_minutes <= $warn_threshold ) {
+      print "$CHECK_NAME WARN - $common_output_data | $perf_data \n";
+      exit $WARN;
+   }
+   #
+   # we should never get this far
+   #
+   print "$CHECK_NAME UNKNOWN - Could not determine uptime $common_output_data | $perf_data \n";
+   exit $UNKNOWN;
+}															#end of subroutine
+
+
+
+
+# ---------------- main body of script -------------------------
+get_options;
+sanity_checks;
+determine_os;
+check_uptime;
+print_output;
+
